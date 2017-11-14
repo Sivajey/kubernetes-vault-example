@@ -1,0 +1,45 @@
+apiVersion: apps/v1beta2
+kind: StatefulSet
+metadata:
+  labels:
+    app: time
+    role: server
+  name: time-server
+  namespace: kubernetes-vault-example-01
+spec:
+  selector:
+    matchLabels:
+      app: time
+      role: server
+  serviceName: time-server-set
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: time
+        role: server
+    spec:
+      containers:
+      - name: server
+        image: eu.gcr.io/kubernetes-vault-example/time-server:1.0-01
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+          name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: time
+    role: server
+  name: time-server
+  namespace: kubernetes-vault-example-01
+spec:
+  selector:
+    app: time
+    role: server
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80

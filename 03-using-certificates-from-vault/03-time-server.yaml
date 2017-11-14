@@ -1,0 +1,68 @@
+apiVersion: apps/v1beta2
+kind: StatefulSet
+metadata:
+  labels:
+    app: time
+    role: server
+  name: time-server
+  namespace: kubernetes-vault-example-03
+spec:
+  selector:
+    matchLabels:
+      app: time
+      role: server
+  serviceName: time-server-set
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: time
+        role: server
+    spec:
+      initContainers:
+      - name: kubernetes-vault-client
+        image: eu.gcr.io/kubernetes-vault-example/kubernetes-vault-client:latest
+        imagePullPolicy: Always
+        args:
+        - kubernetes-vault-client
+        - --config
+        - /config/server.yaml
+        volumeMounts:
+        - name: kubernetes-vault-client-config
+          mountPath: /config
+        - name: secret
+          mountPath: /secret
+      containers:
+      - name: server
+        image: eu.gcr.io/kubernetes-vault-example/time-server:1.0-03
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 443
+          name: https
+        volumeMounts:
+        - name: secret
+          mountPath: /secret
+      volumes:
+      - name: kubernetes-vault-client-config
+        configMap:
+          name: kubernetes-vault-client
+      - name: secret
+        emptyDir:
+          medium: Memory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: time
+    role: server
+  name: time-server
+  namespace: kubernetes-vault-example-03
+spec:
+  selector:
+    app: time
+    role: server
+  ports:
+  - protocol: TCP
+    port: 443
+    targetPort: 443

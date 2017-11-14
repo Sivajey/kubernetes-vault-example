@@ -1,0 +1,23 @@
+apiVersion: v1
+data:
+  config.yaml: |
+    address: https://vault.example.com
+    auth:
+      type: kubernetes
+      backend: kubeauth
+      data:
+        role: time-server-credentials-reader
+    mode:
+      name: initC
+      data:
+        kv:
+          - path: secret/time-server-credentials
+            key: username
+            mountPath: /secret/username
+          - path: secret/time-server-credentials
+            key: password
+            mountPath: /secret/password
+kind: ConfigMap
+metadata:
+  name: kubernetes-vault-client
+  namespace: kubernetes-vault-example-02

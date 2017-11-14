@@ -1,0 +1,48 @@
+apiVersion: apps/v1beta2
+kind: StatefulSet
+metadata:
+  labels:
+    app: time
+    role: client
+  name: time-client
+  namespace: kubernetes-vault-example-03
+spec:
+  selector:
+    matchLabels:
+      app: time
+      role: client
+  serviceName: time-client-set
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: time
+        role: client
+    spec:
+      initContainers:
+      - name: kubernetes-vault-client
+        image: eu.gcr.io/kubernetes-vault-example/kubernetes-vault-client:latest
+        imagePullPolicy: Always
+        args:
+        - kubernetes-vault-client
+        - --config
+        - /config/client.yaml
+        volumeMounts:
+        - name: kubernetes-vault-client-config
+          mountPath: /config
+        - name: secret
+          mountPath: /secret
+      containers:
+      - name: client
+        image: eu.gcr.io/kubernetes-vault-example/time-client:1.0-03
+        imagePullPolicy: Always
+        volumeMounts:
+        - name: secret
+          mountPath: /secret
+      volumes:
+      - name: kubernetes-vault-client-config
+        configMap:
+          name: kubernetes-vault-client
+      - name: secret
+        emptyDir:
+          medium: Memory
