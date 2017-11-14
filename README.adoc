@@ -1,0 +1,1020 @@
+= kubernetes-vault-example
+:icons: font
+:imagesdir: ./img/
+:toc:
+
+ifdef::env-github[]
+:tip-caption: :bulb:
+:note-caption: :information_source:
+:important-caption: :heavy_exclamation_mark:
+:caution-caption: :fire:
+:warning-caption: :warning:
+endif::[]
+
+== Introduction
+
+In this example, one will walk through the steps necessary to transform an
+insecure web application — one that stores sensitive information, like credentials,
+in the code itself and does not use TLS — into a secure application that uses Vault
+for the management of secrets and TLS certificates.
+
+The application used as an example is a simple HTTP _time server_ that
+responds to `GET /` requests with the current date and time.
+
+[#img-overview]
+.Overview of the application.
+image::overview.png[Overview of the application.,50%]
+
+The goals of this example are to:
+* Replace hardcoded credentials with a secret stored in Vault, and
+* Replace HTTP basic authentication with mutual TLS authentication,
+establishing TLS-secured communications as a result.
+
+== Pre-Requisites
+
+* A GKE cluster running Kubernetes *_v1.8.1_* or higher.
+* The `kubectl` binary and proper configuration in order to access this cluster.
+* A deployment of Vault configured as described in the [`kubernetes-vault documentation`](https://github.com/travelaudience/kubernetes-vault).
+* It is assumed that:
+** Vault is reachable at https://vault.example.com.
+** An instance of the
+   https://www.vaultproject.io/docs/auth/kubernetes.html[Kubernetes authentication backend]
+   has been mounted as `kubeauth` and is properly configured to access to the
+   abovementioned cluster.
+** Two instances of the
+   https://www.vaultproject.io/docs/secrets/pki/index.html[PKI secret backend]
+   have been mounted as `root-ca` and `intermediate-ca`.
+* The `vault` binary and a Vault root token for provisioning Vault are available.
+
+[IMPORTANT]
+====
+For the sake of clarity and completeness one will be provisioning Vault as one
+progresses through the example. However, in a real-world scenario Vault should
+be provisioned by an authorized operator instead of a developer. In that
+scenario the last requirement can be dropped.
+====
+
+== Initial Example
+
+The code for the initial examples lives in the `01-initial-example` directory.
+It consists of two simple applications written in Go — a server and a client.
+One should inspect the code and fully understand it before proceeding.
+
+The `01-initial-example` directory also includes Kubernetes manifests that can
+be used to deploy the client and the server. After inspecting the code carefully
+one should run the following commands to deploy the application to the cluster.
+
+Create the `kubernetes-vault-example-01` namespace:
+[source,bash]
+----
+$ kubectl create -f 01-initial-example/01-namespace.yaml
+namespace "kubernetes-vault-example-01" created
+----
+
+Create the `time-server` stateful set and expose it as a service to the cluster:
+[source,bash]
+----
+$ kubectl create -f 01-initial-example/02-time-server.yaml
+statefulset "time-server" created
+service "time-server" created
+----
+
+Create the `time-client` stateful set.
+[source,bash]
+----
+$ kubectl create -f 01-initial-example/03-time-client.yaml
+statefulset "time-client" created
+----
+
+At this point, inspecting pods in the `kubernetes-vault-example-01` namespace
+will reveal two pods, as expected:
+
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-01 get pod
+NAME            READY     STATUS    RESTARTS   AGE
+time-client-0   1/1       Running   0          8s
+time-server-0   1/1       Running   0          12s
+----
+
+One may also inspect the server and client logs to make sure everythins is
+working properly.
+
+Fetch logs from the `time-server-0` pod in the `kubernetes-vault-example-01` namespace:
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-01 logs time-server-0
+2017/11/13 08:49:58 got time request from 'time-client'
+2017/11/13 08:50:03 got time request from 'time-client'
+2017/11/13 08:50:08 got time request from 'time-client'
+(...)
+----
+
+Above, one can see that a client named `time-client` is making periodic requests.
+
+Now, fetch the logs from the `time-client-0` pod in the `kubernetes-vault-example-01` namespace:
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-01 logs time-client-0
+2017/11/13 08:49:58 got time from server: 2017-11-13T08:49:58Z
+2017/11/13 08:50:03 got time from server: 2017-11-13T08:50:03Z
+2017/11/13 08:50:08 got time from server: 2017-11-13T08:50:08Z
+(...)
+----
+
+One can observe the server is responding with the date and time.
+
+The example works as expected, but inspecting the code quickly reveals a major
+security issue. The credentials used for authentication are hardcoded in both
+`server.go` and `client.go`:
+
+[source,go]
+----
+const (
+  Username = "time-client"
+  Password = "safe#passw0rd!"
+)
+----
+
+In order to solve this problem one will use Vault to securely store and distribute
+the credentials as a secret and `kubernetes-vault-client` to inject this secret
+into each pod.
+
+== Using Secrets From Vault
+
+=== Configuring and Provisioning Vault
+
+In order to provision the credentials as a Vault secret, one should first
+authenticate with Vault using the Vault root token:
+
+[source,bash]
+----
+$ export VAULT_ADDR="https://vault.example.com"
+
+$ vault auth
+Token (will be hidden): <insert_root_token>
+Successfully authenticated! You are now logged in.
+token: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+token_duration: 0
+token_policies: [root]
+----
+
+Then one may create the secret itself:
+
+[source,bash]
+----
+$ vault write secret/time-server-credentials \
+    username="time-client" \
+    password="safe#passw0rd!"
+Success! Data written to: secret/time-server-credentials
+----
+
+[IMPORTANT]
+====
+For security purposes, one must make sure this command doesn't end up in
+the shell history.
+====
+
+[NOTE]
+====
+- The path to the secret is `secret/time-server-credentials`.
+- The secret contains a key named `username` with value `time-client`.
+- The secret contains a key named `password` with value `safe#passw0rd!`.
+====
+
+Once one has created the secret one can create a
+https://www.vaultproject.io/docs/concepts/policies.html[policy] that will
+control access to it:
+
+[source,bash]
+----
+$ cat <<EOF > time-server-credentials-ro.hcl
+path "secret/time-server-credentials" { # <1>
+    capabilities = ["read"] # <1>
+}
+EOF
+$ vault write sys/policy/time-server-credentials-ro \
+    rules="@time-server-credentials-ro.hcl"
+Success! Data written to: sys/policy/time-server-credentials-ro
+----
+
+The policy created above, named `time-server-credentials-ro`,
+grants *_read-only_* access to the `secret/time-server-credentials` path.
+
+Finally, one needs to create a role associated with this policy in the
+`kubeauth` authentication backend:
+
+[#role-time-server-credentials-reader]
+[source,bash]
+----
+$ vault write auth/kubeauth/role/time-server-credentials-reader \
+    bound_service_account_names="default" \
+    bound_service_account_namespaces="kubernetes-vault-example-02" \
+    policies="default,time-server-credentials-ro" \
+    period="60s"
+Success! Data written to: auth/kubeauth/role/time-server-credentials-reader
+----
+
+[NOTE]
+====
+- One must replace `kubeauth` with the path to the Kubernetes authentication backend.
+- Only the `default` service account can authenticate with the `time-server-credentials-reader` role.
+- Authentication is also only allowed in the `kubernetes-vault-example-02` namespace.
+- The set of policies associated with this role are `default` and `time-server-credentials-ro`.
+- Tokens issued by this role will have a TTL of one minute, being renewable indefinitely.
+====
+
+To make sure everything is in place, one may lookup the newly created policy and
+role:
+
+[source,bash]
+----
+$ vault policies time-server-credentials-ro
+path "secret/time-server-credentials" {
+    capabilities = ["read"]
+}
+
+$ vault read auth/kubeauth/role/time-server-credentials-reader
+Key                             	Value
+---                             	-----
+bound_service_account_names     	[default]
+bound_service_account_namespaces	[kubernetes-vault-example-02]
+max_ttl                         	0
+num_uses                        	0
+period                          	60
+policies                        	[default time-server-credentials-ro]
+ttl                             	0
+----
+
+At this point one is ready to start injecting Vault secrets into pods.
+
+=== Using `kubernetes-vault-client`
+
+[`kubernetes-vault-client`](https://github.com/travelaudience/kubernetes-vault-client) runs as an
+https://kubernetes.io/docs/concepts/workloads/pods/init-containers/[*_init container_*]
+that authenticates with Vault and dumps secrets as files to a shared volume.
+
+==== Refactoring the Code
+
+The first step towards using secrets from Vault is to change the
+existing code in order to read the credentials from the filesystem.
+
+The updated code lives in the `02-using-secrets-from-vault` directory. One
+should carefully analyze the changes made to the code before proceeding. The
+most important change is the removal of:
+
+[source,go]
+----
+const (
+  Username = "time-client"
+  Password = "safe#passw0rd!"
+)
+----
+
+the introduction of the pathes where the credentials will be mounted:
+
+[source,go]
+----
+const (
+  PathToUsername = "/secret/username"
+  PathToPassword = "/secret/password"
+)
+----
+
+and last, read the credentials:
+
+[source,go]
+----
+if val, err := ioutil.ReadFile(PathToUsername); err != nil {
+	log.Fatalf("failed to read secret from %s: %v", PathToUsername, err)
+} else {
+	username = string(val)
+}
+
+if val, err := ioutil.ReadFile(PathToPassword); err != nil {
+	log.Fatalf("failed to read secret from %s: %v", PathToPassword, err)
+} else {
+	password = string(val)
+}
+----
+
+==== Updating the Kubernetes Manifests
+
+With the code ready to read the secrets from the filesystem the only thing that
+is missing is to bring in `kubernetes-vault-client`. To achieve this, one has to
+perform two steps:
+
+* Create the `ConfigMap` that `kubernetes-vault-client` will use to
+  configure itself;
+* Update the Kubernetes manifests in order to launch `kubernetes-vault-client` as an init container.
+
+The contents of the `ConfigMap`, which can be found in
+`02-using-secrets-from-vault/02-configmap.yaml`, should be similar to the
+following:
+
+[source,yaml]
+----
+apiVersion: v1
+data:
+  config.yaml: |
+    address: https://vault.example.com
+    auth:
+      type: kubernetes
+      backend: kubeauth
+      data:
+        role: time-server-credentials-reader
+    mode:
+      name: initC
+      data:
+        kv:
+          - path: secret/time-server-credentials
+            key: username
+            mountPath: /secret/username
+          - path: secret/time-server-credentials
+            key: password
+            mountPath: /secret/password
+kind: ConfigMap
+metadata:
+  name: kubernetes-vault-client
+  namespace: kubernetes-vault-example-02
+----
+
+[NOTE]
+====
+- One must replace `vault.example.com` with the domain where Vault can be reached.
+- The type of authentication backend being used. This has the fixed value `kubernetes`.
+- One must replace `kubeauth` with the actual path to the mount in Vault.
+- The <<role-time-server-credentials-reader,role>> being requested by the application.
+- Instruct `kubernetes-vault-client` to request the `username` key from
+`secret/time-server-credentials` and dump it to `/secret/username`.
+- Instruct `kubernetes-vault-client` to request the `password` key from
+`secret/time-server-credentials` and dump it to `/secret/password`.
+====
+
+The changes required in the Kubernetes manifests consist of four items:
+
+* Create a volume of type `configMap` referencing the `ConfigMap` created
+  above.
+* Create a volume of type `emptyDir` with spec `medium: Memory` that will act as
+  a shared `tmpfs` volume between `kubernetes-vault-client` and the
+  applications.
+* Add `kubernetes-vault-client` as an init container.
+* Mount the `configMap` and the `emptyDir` volumes in the init container, and
+  mount the `emptyDir` volume in the application's container as well.
+
+The final result can be seen at
+`02-using-secrets-from-vault/03-time-server.yaml` and
+`02-using-secrets-from-vault/04-time-client.yaml`. One should carefully analyze
+the differences between these files and the ones in `01-initial-example` before
+proceeding.
+
+[IMPORTANT]
+====
+If the Kubernetes cluster being used has
+https://kubernetes.io/docs/admin/authorization/rbac/[RBAC] enabled one must
+perform an extra step, which is to authorize the service account being used to
+perform a _token review_. Since one is using the `default` service account in
+the `kubernetes-vault-example-02` namespace, one must run
+
+[source,bash]
+----
+$ cat <<EOF | kubectl create -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubernetes-vault-example-02-tokenreview-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: kubernetes-vault-example-02
+EOF
+----
+
+In a real-world scenario every combination of service account and namespace in
+use must have such a `ClusterRoleBinding` associated with it.
+====
+
+==== Running the Example
+
+One is now ready to deploy the example:
+
+[source,bash]
+----
+$ kubectl create -f 02-using-secrets-from-vault/01-namespace.yaml
+namespace "kubernetes-vault-example-02" created
+
+$ kubectl create -f 02-using-secrets-from-vault/02-configmap.yaml
+configmap "kubernetes-vault-client" created
+
+$ kubectl create -f 02-using-secrets-from-vault/03-time-server.yaml
+statefulset "time-server" created
+service "time-server" created
+
+$ kubectl create -f 02-using-secrets-from-vault/04-time-client.yaml
+statefulset "time-client" created
+----
+
+After running the command above one should inspect pods in the
+`kubernetes-vault-example-02` namespace to make sure there are no errors:
+
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-02 get pod
+NAME            READY     STATUS    RESTARTS   AGE
+time-client-0   1/1       Running   0          8s
+time-server-0   1/1       Running   0          12s
+----
+
+If one's output is similar to the above it means that `kubernetes-vault-client`
+ran successfully and dumped the secrets to a path where the applications can
+reach them. To make sure this is the case one can inspect the logs of
+`kubernetes-vault-client`:
+
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-02 logs --container kubernetes-vault-client time-server-0
+time="2017-11-13T08:56:13Z" level=info msg="vault: auth successful" token_accessor=d89bddbd-495a-7bda-df94-eadab700972f token_ttl_sec=60
+time="2017-11-13T08:56:13Z" level=info msg="initC: dump successful"
+$ kubectl --namespace kubernetes-vault-example-02 logs --container kubernetes-vault-client time-client-0
+time="2017-11-13T08:56:16Z" level=info msg="vault: auth successful" token_accessor=fea23820-b56a-56d4-0a74-8c03cf9df93e token_ttl_sec=60
+time="2017-11-13T08:56:16Z" level=info msg="initC: dump successful"
+----
+
+One may also inspect each pod's filesystem to make extra sure the secrets have
+been dumped:
+
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-02 exec time-server-0 -- cat /secret/username
+time-client
+$ kubectl --namespace kubernetes-vault-example-02 exec time-server-0 -- cat /secret/password
+safe#passw0rd!
+$ kubectl --namespace kubernetes-vault-example-02 exec time-client-0 -- cat /secret/username
+time-client
+$ kubectl --namespace kubernetes-vault-example-02 exec time-client-0 -- cat /secret/password
+safe#passw0rd!
+----
+
+The application is a tiny bit more secure now. However, communication is still
+made over plain HTTP. One will take care of setting-up TLS in the next section.
+
+== Using Certificates from Vault
+
+=== Configuring Vault
+
+Most of the configuration needed to start issuing TLS certificates with Vault
+has already been made when configuring the `root-ca` and `intermediate-ca`
+secret backends. There are only two steps missing before one can start:
+
+* To create *_roles_* that specify the properties of each issued certificate.
+* To create *_policies_* that allows requests for certificates from the
+  `intermediate-ca` backend, and to associate then with the `kubeauth` backend.
+
+==== Creating the PKI roles
+
+Since one want to establish mutual TLS authentication, one will need two roles —
+one for the server and one for the client:
+
+[source,bash]
+----
+$ ALLOWED_DOMAINS=(
+    time-server.kubernetes-vault-example-03.svc.cluster.local
+    time-server.kubernetes-vault-example-03
+    time-server
+)
+$ vault write intermediate-ca/roles/time-server \
+    allowed_domains=$(IFS=","; echo "${ALLOWED_DOMAINS[*]}") \
+    allow_subdomains=false \
+    allow_bare_domains=true \
+    max_ttl=2160h \
+    client_flag=false
+----
+
+[NOTE]
+====
+- The role's name is `time-server`.
+- Turn `ALLOWED_DOMAINS` into a comma-separated list of domain names.
+- Do not allow requests for subdomains.
+- Allow requests for bare domains (i.e., domains matching those defined in
+`ALLOWED_DOMAINS`).
+- Make the issued certificates expire in 90 days.
+- Do not set the client flag in issued certificates since these will be used
+    for establishing TLS on the server.
+====
+
+[source,bash]
+----
+$ vault write intermediate-ca/roles/time-client \
+    allowed_domains="time-client" \
+    allow_subdomains="false" \
+    allow_bare_domains="true" \
+    max_ttl="2160h" \
+    server_flag="false"
+----
+
+[NOTE]
+====
+- The role's name is `time-client`.
+- The list of allowed domains is simply `time-client`.
+- Do not allow requests for subdomains.
+- Allow requests for bare domains (i.e., domains matching those defined in
+`ALLOWED_DOMAINS`).
+- Make the issued certificates expire in 90 days.
+- Do not set the server flag in issued certificates since these will be used
+for establishing TLS on the client.
+====
+
+To make extra-sure everything is set-up properly one may read the roles back
+from Vault:
+
+[source,bash]
+----
+$ vault read intermediate-ca/roles/time-server
+Key                    	Value
+---                    	-----
+AllowExpirationPastCA  	false
+allow_any_name         	false
+allow_bare_domains     	true
+allow_base_domain      	false
+allow_glob_domains     	false
+allow_ip_sans          	true
+allow_localhost        	true
+allow_subdomains       	false
+allow_token_displayname	false
+allowed_domains        	time-server.kubernetes-vault-example-03.svc.cluster.local,time-server.kubernetes-vault-example-03,time-server
+client_flag            	false
+code_signing_flag      	false
+email_protection_flag  	false
+enforce_hostnames      	true
+generate_lease         	false
+key_bits               	2048
+key_type               	rsa
+key_usage              	DigitalSignature,KeyAgreement,KeyEncipherment
+max_ttl                	2160h0m0s
+no_store               	false
+organization
+ou
+server_flag            	true
+ttl                    	0s
+use_csr_common_name    	true
+use_csr_sans           	true
+----
+
+[source,bash]
+----
+$ vault read intermediate-ca/roles/time-client
+Key                    	Value
+---                    	-----
+AllowExpirationPastCA  	false
+allow_any_name         	false
+allow_bare_domains     	true
+allow_base_domain      	false
+allow_glob_domains     	false
+allow_ip_sans          	true
+allow_localhost        	true
+allow_subdomains       	false
+allow_token_displayname	false
+allowed_domains        	time-client
+client_flag            	true
+code_signing_flag      	false
+email_protection_flag  	false
+enforce_hostnames      	true
+generate_lease         	false
+key_bits               	2048
+key_type               	rsa
+key_usage              	DigitalSignature,KeyAgreement,KeyEncipherment
+max_ttl                	2160h0m0s
+no_store               	false
+organization
+ou
+server_flag            	false
+ttl                    	0s
+use_csr_common_name    	true
+use_csr_sans           	true
+----
+
+If the output is similar to the above it is safe to proceed.
+
+==== Creating the Policy and Authentication Roles
+
+Create a policy named `time-server` that grants *_write_* access to the
+`intermediate-ca/issue/time-server` path:
+
+[source,bash]
+----
+$ cat <<EOF > time-server.hcl
+path "intermediate-ca/issue/time-server" {
+    capabilities = ["create", "update"]
+}
+EOF
+
+$ vault write sys/policy/time-server \
+    rules="@time-server.hcl"
+Success! Data written to: sys/policy/time-server
+----
+
+Create a policy named `time-client` that grants *_write_* access to the
+`intermediate-ca/issue/time-client` path:
+
+[source,bash]
+----
+$ cat <<EOF > time-client.hcl
+path "intermediate-ca/issue/time-client" {
+    capabilities = ["create", "update"]
+}
+EOF
+
+$ vault write sys/policy/time-client \
+    rules="@time-client.hcl"
+Success! Data written to: sys/policy/time-client
+----
+
+Once the policies have been created one can create the necessary roles in the
+`kubeauth` authentication backend:
+
+[source,bash]
+----
+$ vault write auth/kubeauth/role/time-server \
+    bound_service_account_names="default" \
+    bound_service_account_namespaces="kubernetes-vault-example-03" \
+    policies="default,time-server" \
+    period="60s"
+Success! Data written to: auth/kubeauth/role/time-server
+----
+
+[NOTE]
+====
+- One must replace `kubeauth` with the path to the Kubernetes authentication
+backend.
+- Only the `default` service account can authenticate with this role.
+- Authentication is also only allowed in the `kubernetes-vault-example-03`
+namespace.
+-The set of policies associated with this role are `default` and `time-server`.
+- Tokens issued by this role will have a TTL of one minute, being renewable
+indefinitely.
+====
+
+[source,bash]
+----
+$ vault write auth/kubeauth/role/time-client \
+    bound_service_account_names="default" \
+    bound_service_account_namespaces="kubernetes-vault-example-03" \
+    policies="default,time-client" \
+    period="60s"
+Success! Data written to: auth/kubeauth/role/time-client
+----
+
+[NOTE]
+====
+- One must replace `kubeauth` with the path to the Kubernetes authentication
+backend.
+- Only the `default` service account can authenticate with this role.
+- Authentication is also only allowed in the `kubernetes-vault-example-03`
+namespace.
+- The set of policies associated with this role are `default` and
+`time-client`.
+- Tokens issued by this role will have a TTL of one minute, being renewable
+indefinitely.
+====
+
+At this point one is ready to start using `kubernetes-vault-client` to inject
+certificates into pods.
+
+=== Using `kubernetes-vault-client`
+
+==== Refactoring the Code
+
+The updated code lives in the `03-using-certificates-from-vault` directory. One
+should carefully analyze the changes made to the code before proceeding. These
+are a bit more complex than those made in the previous iteration, but mostly
+involve setting up TLS and requiring certificate validation in both the client
+and the server. Also, one should note that `time-server` now listens on port
+`443` instead of port `80`.
+
+==== Updating the Kubernetes Manifests
+
+With the code ready to read certificates and private keys from the filesystem,
+the only thing that is missing is to update the existing Kubernetes manifests.
+One should carefully analyze the changes made to the manifests before
+proceeding. The most notable changes are those in the `ConfigMap`, which now
+looks like this:
+
+[source,bash]
+----
+apiVersion: v1
+data:
+  server.yaml: |
+    address: https://vault.example.com
+    auth:
+      type: kubernetes
+      backend: kubeauth
+      data:
+        role: time-server
+    mode:
+      name: initC
+      data:
+        pki:
+          - mountName: intermediate-ca
+            role: time-server
+            cn: time-server.kubernetes-vault-example-03.svc.cluster.local
+            sans:
+            - time-server.kubernetes-vault-example-03
+            - time-server
+            - localhost
+            - 127.0.0.1
+            cnIsIdentifier: false
+            mountDir: /secret
+  client.yaml: |
+    address: https://vault.example.com
+    auth:
+      type: kubernetes
+      backend: kubeauth
+      data:
+        role: time-client
+    mode:
+      name: initC
+      data:
+        pki:
+          - mountName: intermediate-ca
+            role: time-client
+            cn: time-client
+            cnIsIdentifier: true
+            mountDir: /secret
+kind: ConfigMap
+metadata:
+  name: kubernetes-vault-client
+  namespace: kubernetes-vault-example-03
+----
+
+[NOTE]
+====
+- Once mounted, the `server.yaml` file will contain the configuration for the
+`kubernetes-vault-client` instance that will request certificates for `time-server`.
+- Instead of requesting secrets from a `kv` backend like in the previous
+iteration, one will now request certificates from a `pki` backend.
+- The name of the `pki` backend from which one will request certificates.
+- The name of the role in the `pki` backend corresponding to the desired
+configuration.
+- The *_common name_* (`CN`) one wants for the certificate.
+- A list of *_subject alternative names_* one wants for the certificate.
+- One should indicate that the `CN` being requested is not an identifier
+(i.e., it is a domain name).
+- One mounted, the `client.yaml` file will contain the configuration for the
+`kubernetes-vault-client` instance that will request certificates for
+`time-client`.
+- In the case of `time-client` the `CN` being requested is actually an
+identifier.
+====
+
+The final result can be seen at `03-using-secrets-from-vault`. One should
+carefully analyze the differences between the manifests in this directory and
+the ones in `02-using-secrets-from-vault` before proceeding.
+
+[IMPORTANT]
+====
+If the Kubernetes cluster being used has
+https://kubernetes.io/docs/admin/authorization/rbac/[RBAC] enabled one must
+perform an extra step, which is to authorize the service account being used to
+perform a _token review_. Since one is using the `default` service account in
+the `kubernetes-vault-example-03` namespace, one must run
+
+[source,bash]
+----
+$ cat <<EOF | kubectl create -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubernetes-vault-example-02-tokenreview-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: kubernetes-vault-example-03
+EOF
+----
+
+In a real-world scenario every combination of service account and namespace in
+use must have such a `ClusterRoleBinding` associated with it.
+====
+
+==== Running the Example
+
+One is now ready to deploy the example:
+
+[source,bash]
+----
+$ kubectl create -f 03-using-certificates-from-vault/01-namespace.yaml
+namespace "kubernetes-vault-example-02" created
+
+$ kubectl create -f 03-using-certificates-from-vault/02-configmap.yaml
+configmap "kubernetes-vault-client" created
+
+$ kubectl create -f 03-using-certificates-from-vault/03-time-server.yaml
+statefulset "time-server" created
+service "time-server" created
+
+$ kubectl create -f 03-using-certificates-from-vault/04-time-client.yaml
+statefulset "time-client" created
+----
+
+After running the command above one should inspect pods in the
+`kubernetes-vault-example-03` namespace to make sure there are no errors:
+
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-03 get pod
+NAME            READY     STATUS    RESTARTS   AGE
+time-client-0   1/1       Running   0          8s
+time-server-0   1/1       Running   0          12s
+----
+
+If one's output is similar to the above it means that `kubernetes-vault-client`
+ran successfully and dumped the certificates to a path where the applications
+can reach them. To make sure this is the case one can inspect the logs of
+`kubernetes-vault-client`:
+
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-03 logs --container kubernetes-vault-client time-server-0
+time="2017-11-13T09:00:50Z" level=info msg="vault: auth successful" token_accessor=87b2df55-b032-2598-f05d-20baf04dc1af token_ttl_sec=60
+time="2017-11-13T09:00:51Z" level=info msg="initC: dump successful"
+
+$ kubectl --namespace kubernetes-vault-example-03 logs --container kubernetes-vault-client time-client-0
+time="2017-11-13T09:00:54Z" level=info msg="vault: auth successful" token_accessor=5d636966-59f3-81ed-4382-8507b0428c3c token_ttl_sec=60
+time="2017-11-13T09:00:54Z" level=info msg="initC: dump successful"
+----
+
+=== Inspecting Mutual TLS Authentication
+
+To make extra-sure mutual TLS is working properly, one may make a few simple
+tests against `time-server`. First, one should copy the certificates from the
+`time-client-0` container into the local workstation:
+
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-03 cp time-client-0:/secret/chain.pem ./chain.pem
+tar: removing leading '/' from member names
+
+$ kubectl --namespace kubernetes-vault-example-03 cp time-client-0:/secret/crt.pem ./crt.pem
+tar: removing leading '/' from member names
+
+$ kubectl --namespace kubernetes-vault-example-03 cp time-client-0:/secret/crt.pem ./key.pem
+tar: removing leading '/' from member names
+----
+
+Then, one may verify the `crt.pem` certificate's authenticity according to the
+`chain.pem` CA bundle:
+
+[source,bash]
+----
+$ openssl verify -CAfile ./chain.pem -purpose sslclient ./crt.pem
+./crt.pem: OK <1>
+----
+<1> The client certificate issued to `time-client-0` is valid.
+
+One may also inspect the certificate itself:
+
+[source,bash]
+----
+$ openssl x509 -in ./crt.pem -noout -text
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            61:f0:03:65:6a:00:b5:29:9f:e2:fc:a6:0b:f6:ef:ac:d7:62:07:32
+    Signature Algorithm: sha256WithRSAEncryption
+        Issuer: CN=Example Ltd. Intermediate CA <1>
+        Validity
+            Not Before: Nov 13 09:00:24 2017 GMT <2>
+            Not After : Dec 15 09:00:54 2017 GMT <2>
+        Subject: CN=time-client <3>
+        Subject Public Key Info:
+            Public Key Algorithm: rsaEncryption
+                Public-Key: (2048 bit)
+                Modulus:
+                    00:c6:b9:10:89:e2:2d:51:fb:51:92:1b:9b:fc:5b:
+                    1a:f6:b4:65:49:9e:59:65:c1:1c:19:9d:8d:09:5b:
+                    22:a1:a0:69:15:4d:80:cc:7a:bd:60:3e:5f:17:16:
+                    c9:16:15:bf:73:4f:4a:bc:bd:08:2e:29:92:b3:ff:
+                    13:ad:44:02:62:56:58:3c:22:58:9b:92:65:11:22:
+                    03:e6:83:47:07:bd:fd:3c:4a:72:8a:7d:63:1d:ad:
+                    81:1d:96:eb:2b:fe:02:ad:ed:c4:a1:e8:cf:8e:9b:
+                    04:1a:9c:cc:05:ad:cd:a0:71:c8:e7:a6:a1:82:81:
+                    04:f6:e2:d3:8f:2b:7f:79:91:92:1e:ef:c5:8f:b2:
+                    d0:5e:66:44:48:b6:35:bd:dc:0e:dc:02:ab:ae:ad:
+                    51:63:d9:75:28:f1:bf:30:9b:0e:9a:2d:33:59:f9:
+                    fe:2a:46:71:03:04:2b:c4:36:83:82:cc:90:f8:b9:
+                    1f:45:e9:4f:1c:b4:d6:44:39:e9:da:b4:98:b7:7b:
+                    98:7b:e4:b2:4d:bd:94:65:97:e9:86:dd:54:59:5e:
+                    be:bd:40:0c:da:27:9a:b7:ea:3b:47:e9:a8:3f:57:
+                    89:f0:19:a4:da:71:e9:45:a3:ab:1d:e2:32:cd:36:
+                    51:ac:c8:13:a8:ab:4d:a3:13:a1:8e:bd:07:9d:89:
+                    b1:6f
+                Exponent: 65537 (0x10001)
+        X509v3 extensions:
+            X509v3 Key Usage: critical
+                Digital Signature, Key Encipherment, Key Agreement
+            X509v3 Extended Key Usage:
+                TLS Web Client Authentication <4>
+            X509v3 Subject Key Identifier:
+                68:9C:DE:D6:5A:52:84:CF:16:69:DF:A3:7A:45:B8:4A:15:2A:1A:2C
+            X509v3 Authority Key Identifier:
+                keyid:2E:52:2E:F7:E8:E1:26:D4:66:CC:CB:2C:E4:F8:4F:7B:D3:FD:95:5C
+
+    Signature Algorithm: sha256WithRSAEncryption
+         4b:ce:d2:60:b3:cc:2d:0c:b3:41:34:47:f9:ae:e2:cd:ec:b4:
+         f6:0e:3e:44:f9:42:20:8f:27:01:04:2b:b4:4f:48:ba:2b:ec:
+         13:27:8f:a1:e3:3c:8b:d7:08:23:6c:24:13:24:85:f6:ea:06:
+         27:71:48:2c:ab:1e:78:59:48:6e:b2:1f:e7:d6:95:75:d6:53:
+         3c:84:74:3f:2e:38:64:27:e8:01:d8:0e:08:c4:15:4b:e4:52:
+         f0:b0:76:12:88:74:e2:75:63:d5:6f:ee:fc:df:81:95:c1:ba:
+         1d:f3:6f:80:dc:01:94:31:ae:3b:79:7e:f6:b5:6a:62:62:b1:
+         1f:2e:81:dc:04:22:cd:9f:ad:f1:50:7b:ea:81:b2:46:d7:90:
+         6c:ca:05:2c:02:6b:9f:36:72:84:ab:71:37:ce:d3:e0:c4:11:
+         3b:2f:53:9b:61:62:37:b7:04:19:fd:94:cb:47:9d:e4:45:10:
+         11:a7:30:7d:92:55:7b:3a:54:19:4a:62:8f:93:4d:bb:26:0e:
+         2c:1b:33:27:48:77:58:66:ae:a2:1d:6b:9e:51:e5:16:c3:73:
+         81:58:cb:45:d5:08:80:67:99:8f:2e:c9:f4:98:8d:14:53:17:
+         f3:4e:88:71:d1:65:a0:12:d4:73:da:37:a2:a1:d0:ac:ec:c7:
+         b2:2f:96:0f
+----
+<1> The certificate was issued by `Example Ltd. Intermediate CA`.
+<2> The certificate has a validity of 90 days.
+<3> The certificate's `CN` is `time-client`.
+<4> The certificate can be used as client certificate for TLS.
+
+One may also want to inspect if the certificate and the private key match:
+
+[source,bash]
+----
+$ openssl x509 -in ./crt.pem -noout -modulus
+Modulus=C6B91089E22D51FB51921B9BFC5B1AF6B465499E5965C11C199D8D095B22A1A069154D80CC7ABD603E5F1716C91615BF734F4ABCBD082E2992B3FF13AD44026256583C22589B9265112203E6834707BDFD3C4A728A7D631DAD811D96EB2BFE02ADEDC4A1E8CF8E9B041A9CCC05ADCDA071C8E7A6A1828104F6E2D38F2B7F7991921EEFC58FB2D05E664448B635BDDC0EDC02ABAEAD5163D97528F1BF309B0E9A2D3359F9FE2A467103042BC4368382CC90F8B91F45E94F1CB4D64439E9DAB498B77B987BE4B24DBD946597E986DD54595EBEBD400CDA279AB7EA3B47E9A83F5789F019A4DA71E945A3AB1DE232CD3651ACC813A8AB4DA313A18EBD079D89B16F <1>
+$ openssl rsa -in ./key.pem -noout -modulus
+Modulus=C6B91089E22D51FB51921B9BFC5B1AF6B465499E5965C11C199D8D095B22A1A069154D80CC7ABD603E5F1716C91615BF734F4ABCBD082E2992B3FF13AD44026256583C22589B9265112203E6834707BDFD3C4A728A7D631DAD811D96EB2BFE02ADEDC4A1E8CF8E9B041A9CCC05ADCDA071C8E7A6A1828104F6E2D38F2B7F7991921EEFC58FB2D05E664448B635BDDC0EDC02ABAEAD5163D97528F1BF309B0E9A2D3359F9FE2A467103042BC4368382CC90F8B91F45E94F1CB4D64439E9DAB498B77B987BE4B24DBD946597E986DD54595EBEBD400CDA279AB7EA3B47E9A83F5789F019A4DA71E945A3AB1DE232CD3651ACC813A8AB4DA313A18EBD079D89B16F <1>
+----
+<1> The _moduli_ do match, which means the private key is valid for the
+    certificate.
+
+Finally, one may want to make a "manual" request to `time-server`. To do that
+one should first run the following commain *_in a separate terminal window_*:
+
+[source,bash]
+----
+$ kubectl --namespace kubernetes-vault-example-03 port-forward time-server-0 8443:443
+Forwarding from 127.0.0.1:8443 -> 443
+----
+
+Then, back to the original terminal window, one should first run
+
+[source,bash]
+----
+$ curl https://localhost:8443/
+curl: (60) SSL certificate problem: unable to get local issuer certificate
+More details here: https://curl.haxx.se/docs/sslcerts.html
+
+curl performs SSL certificate verification by default, using a "bundle"
+ of Certificate Authority (CA) public keys (CA certs). If the default
+ bundle file isn't adequate, you can specify an alternate file
+ using the --cacert option.
+If this HTTPS server uses a certificate signed by a CA represented in
+ the bundle, the certificate verification probably failed due to a
+ problem with the certificate (it might be expired, or the name might
+ not match the domain name in the URL).
+If you'd like to turn off curl's verification of the certificate, use
+ the -k (or --insecure) option.
+HTTPS-proxy has similar options --proxy-cacert and --proxy-insecure.
+----
+
+This means that `cURL` was unable to verify the authenticity of the server's
+certificate. This is expected, because it is signed by a custom certificate
+authority (the `intermediate-ca`). If one runs the command again but this time
+telling `cURL` about one's certificate authority, the result will be slightly
+different:
+
+[source,bash]
+----
+$ curl --cacert ./chain.pem https://localhost:8443/
+curl: (35) error:14094412:SSL routines:SSL3_READ_BYTES:sslv3 alert bad certificate # <1>
+----
+<1> The actual error code may differ between systems.
+
+In short, this means that `cURL` was able to validate the server's certificate
+but the server was not provided with a client certificate — which means that
+mutual TLS authentication is in fact in place. To be able to make a successful
+request one must provide the client certificate and private key:
+
+[source,bash]
+----
+$ curl --cacert ./chain.pem --cert ./crt.pem --key ./key.pem https://localhost:8443/
+2017-11-12T16:11:21Z
+----
+
+One can easily see that this last request was successful, and that mutual TLS
+authentication is indeed is place.
