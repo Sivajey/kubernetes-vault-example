@@ -194,7 +194,7 @@ path "secret/time-server-credentials" { # <1>
 }
 EOF
 $ vault write sys/policy/time-server-credentials-ro \
-    rules="@time-server-credentials-ro.hcl"
+    policy="@time-server-credentials-ro.hcl"
 Success! Data written to: sys/policy/time-server-credentials-ro
 ----
 
@@ -613,7 +613,7 @@ path "intermediate-ca/issue/time-server" {
 EOF
 
 $ vault write sys/policy/time-server \
-    rules="@time-server.hcl"
+    policy="@time-server.hcl"
 Success! Data written to: sys/policy/time-server
 ----
 
@@ -629,7 +629,7 @@ path "intermediate-ca/issue/time-client" {
 EOF
 
 $ vault write sys/policy/time-client \
-    rules="@time-client.hcl"
+    policy="@time-client.hcl"
 Success! Data written to: sys/policy/time-client
 ----
 
