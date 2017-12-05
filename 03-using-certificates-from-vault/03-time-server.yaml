@@ -21,7 +21,7 @@ spec:
     spec:
       initContainers:
       - name: kubernetes-vault-client
-        image: eu.gcr.io/kubernetes-vault-example/kubernetes-vault-client:latest
+        image: quay.io/travelaudience/kubernetes-vault-client:1.0.0
         imagePullPolicy: Always
         args:
         - kubernetes-vault-client
@@ -34,7 +34,7 @@ spec:
           mountPath: /secret
       containers:
       - name: server
-        image: eu.gcr.io/kubernetes-vault-example/time-server:1.0-03
+        image: quay.io/travelaudience/time-server:1.0.0-03
         imagePullPolicy: Always
         ports:
         - containerPort: 443

@@ -54,6 +54,19 @@ be provisioned by an authorized operator instead of a developer. In that
 scenario the last requirement can be dropped.
 ====
 
+== Building and Pushing Docker Images
+
+In order to build and push the Docker images required for this example one must
+run
+
+[source,bash]
+----
+$ ./docker-push.sh
+----
+
+In case one needs to customize the image names or versions one may use the
+`CLIENT_IMAGE`, `SERVER_IMAGE` and `VERSION` environment variables.
+
 == Initial Example
 
 The code for the initial examples lives in the `01-initial-example` directory.
