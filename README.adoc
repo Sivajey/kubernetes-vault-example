@@ -34,7 +34,7 @@ establishing TLS-secured communications as a result.
 
 * A GKE cluster running Kubernetes *_v1.8.1_* or higher.
 * The `kubectl` binary and proper configuration in order to access this cluster.
-* A deployment of Vault configured as described in the [`kubernetes-vault documentation`](https://github.com/travelaudience/kubernetes-vault).
+* A deployment of Vault configured as described in the https://github.com/travelaudience/kubernetes-vault[`kubernetes-vault documentation`].
 * It is assumed that:
 ** Vault is reachable at https://vault.example.com.
 ** An instance of the
