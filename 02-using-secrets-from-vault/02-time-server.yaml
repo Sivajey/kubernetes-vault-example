@@ -3,46 +3,60 @@ kind: StatefulSet
 metadata:
   labels:
     app: time
-    role: client
-  name: time-client
-  namespace: kubernetes-vault-example-03
+    role: server
+  name: time-server
 spec:
   selector:
     matchLabels:
       app: time
-      role: client
-  serviceName: time-client-set
+      role: server
+  serviceName: time-server-set
   replicas: 1
   template:
     metadata:
       labels:
         app: time
-        role: client
+        role: server
     spec:
       initContainers:
       - name: kubernetes-vault-client
         image: quay.io/travelaudience/kubernetes-vault-client:1.0.0
         imagePullPolicy: Always
-        args:
-        - kubernetes-vault-client
-        - --config
-        - /config/client.yaml
         volumeMounts:
         - name: kubernetes-vault-client-config
           mountPath: /config
         - name: secret
           mountPath: /secret
       containers:
-      - name: client
-        image: quay.io/travelaudience/time-client:1.0.0-03
+      - name: server
+        image: quay.io/travelaudience/time-server:1.0.0-02
         imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+          name: http
         volumeMounts:
         - name: secret
           mountPath: /secret
       volumes:
       - name: kubernetes-vault-client-config
         configMap:
-          name: kubernetes-vault-client
+          name: kubernetes-vault-client-02
       - name: secret
         emptyDir:
           medium: Memory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: time
+    role: server
+  name: time-server
+spec:
+  selector:
+    app: time
+    role: server
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80

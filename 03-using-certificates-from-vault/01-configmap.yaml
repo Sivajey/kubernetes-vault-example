@@ -1,10 +1,10 @@
 apiVersion: v1
 data:
   server.yaml: |
-    address: https://vault.example.com
+    address: https://vault.travelaudience.com
     auth:
       type: kubernetes
-      backend: kubeauth
+      backend: training-235717-gke-1
       data:
         role: time-server
     mode:
@@ -13,21 +13,21 @@ data:
         pki:
           - mountName: intermediate-ca
             role: time-server
-            cn: time-server.kubernetes-vault-example-03.svc.cluster.local
+            cn: time-server.default.svc.cluster.local
             sans:
-            - time-server.kubernetes-vault-example-03
+            - time-server.default
             - time-server
             - localhost
             - 127.0.0.1
             cnIsIdentifier: false
             mountDir: /secret
   client.yaml: |
-    address: https://vault.example.com
+    address: https://vault.travelaudience.com
     auth:
       type: kubernetes
-      backend: kubeauth
+      backend: training-235717-gke-1
       data:
-        role: time-client
+        role: time-server
     mode:
       name: initC
       data:
@@ -39,5 +39,4 @@ data:
             mountDir: /secret
 kind: ConfigMap
 metadata:
-  name: kubernetes-vault-client
-  namespace: kubernetes-vault-example-03
+  name: kubernetes-vault-client-03

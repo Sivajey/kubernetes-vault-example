@@ -5,7 +5,6 @@ metadata:
     app: time
     role: server
   name: time-server
-  namespace: kubernetes-vault-example-02
 spec:
   selector:
     matchLabels:
@@ -23,6 +22,10 @@ spec:
       - name: kubernetes-vault-client
         image: quay.io/travelaudience/kubernetes-vault-client:1.0.0
         imagePullPolicy: Always
+        args:
+        - kubernetes-vault-client
+        - --config
+        - /config/server.yaml
         volumeMounts:
         - name: kubernetes-vault-client-config
           mountPath: /config
@@ -30,18 +33,18 @@ spec:
           mountPath: /secret
       containers:
       - name: server
-        image: quay.io/travelaudience/time-server:1.0.0-02
+        image: quay.io/travelaudience/time-server:1.0.0-03
         imagePullPolicy: Always
         ports:
-        - containerPort: 80
-          name: http
+        - containerPort: 443
+          name: https
         volumeMounts:
         - name: secret
           mountPath: /secret
       volumes:
       - name: kubernetes-vault-client-config
         configMap:
-          name: kubernetes-vault-client
+          name: kubernetes-vault-client-03
       - name: secret
         emptyDir:
           medium: Memory
@@ -53,12 +56,11 @@ metadata:
     app: time
     role: server
   name: time-server
-  namespace: kubernetes-vault-example-02
 spec:
   selector:
     app: time
     role: server
   ports:
   - protocol: TCP
-    port: 80
-    targetPort: 80
+    port: 443
+    targetPort: 443

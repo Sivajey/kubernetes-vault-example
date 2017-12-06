@@ -5,7 +5,6 @@ metadata:
     app: time
     role: client
   name: time-client
-  namespace: kubernetes-vault-example-01
 spec:
   selector:
     matchLabels:
